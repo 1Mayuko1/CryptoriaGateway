@@ -1,3 +1,4 @@
+import numpy as np
 from django.http import JsonResponse
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import MinMaxScaler
@@ -12,6 +13,37 @@ from keras.models import Sequential
 from keras.layers import LSTM, Dense
 
 
+def transform_data_for_lstm(data, lag=1):
+    df = pd.DataFrame(data)
+    columns = [df.shift(i) for i in range(1, lag + 1)]
+    columns.append(df)
+    df = pd.concat(columns, axis=1)
+    df.fillna(0, inplace=True)
+
+    X = df.iloc[:, :-1].values
+    y = df.iloc[:, -1].values
+
+    # Вхідні дані для LSTM повинні мати форму [samples, timesteps, features]
+    X = X.reshape(X.shape[0], X.shape[1], 1)
+
+    return X, y
+
+
+def train_lstm_model(X, y, epochs=50, batch_size=32, neurons=50):
+    model = Sequential()
+    model.add(LSTM(neurons, input_shape=(X.shape[1], X.shape[2])))
+    model.add(Dense(1))
+    model.compile(loss='mean_squared_error', optimizer='adam')
+    model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0)
+
+    return model
+
+
+def lstm_forecast(model, data):
+    data = data.reshape(data.shape[0], 1, data.shape[1])
+    return model.predict(data)
+
+
 def forecast_prices(df, forecast_periods=30):
     # Вибираємо значення закриття для прогнозування
     df.set_index('time_period_start', inplace=True)
@@ -21,14 +53,24 @@ def forecast_prices(df, forecast_periods=30):
         raise ValueError("price_close contains NaN values!")
 
     # Спробуємо автоматичний вибір порядку за допомогою pmdarima
+    # ARIMA прогноз
     try:
-        model = auto_arima(price_close, seasonal=True, trace=True, m=12)
-        forecast = model.predict(n_periods=forecast_periods)
+        model_arima = auto_arima(price_close, seasonal=True, trace=False, m=12)
+        forecast_arima = model_arima.predict(n_periods=forecast_periods)
     except Exception as e:
         print('Error during ARIMA forecasting:', str(e))
         raise ValueError(f"Error forecasting with ARIMA model: {str(e)}")
 
-    return forecast
+    # LSTM прогноз
+    data_lstm_X, data_lstm_y = transform_data_for_lstm(price_close.values)
+    model_lstm = train_lstm_model(data_lstm_X, data_lstm_y)
+    forecast_lstm = lstm_forecast(model_lstm, data_lstm_X[-forecast_periods:])
+
+    # Комбінований прогноз
+    forecast_combined = (np.array(forecast_arima) + np.array(forecast_lstm.flatten())) / 2
+
+    return forecast_combined
+
 
 # def forecast_prices(df, forecast_periods=30):
 #     # Вибираємо значення закриття для прогнозування
