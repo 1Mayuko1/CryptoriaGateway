@@ -14,6 +14,15 @@ from keras.layers import LSTM, Dense
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
+from keras.layers import Conv1D, MaxPooling1D, Flatten
+from keras.layers import Dropout
+from keras.callbacks import EarlyStopping
+
+
+def split_data(data, test_size=0.2):
+    split_idx = int(len(data) * (1 - test_size))
+    train, test = data[:split_idx], data[split_idx:]
+    return train, test
 
 
 def compute_RSI(series, period=14):
@@ -32,6 +41,45 @@ def compute_MACD(series, fast=12, slow=26, signal=9):
     macd = ema_fast - ema_slow
     signal_line = macd.ewm(span=signal, adjust=False).mean()
     return macd, signal_line
+
+
+def compute_RMSE(y_true, y_pred):
+    differences = [true - pred for true, pred in zip(y_true, y_pred)]
+    return np.sqrt(sum([diff ** 2 for diff in differences]) / len(differences))
+
+
+def compute_MAE(y_true, y_pred):
+    differences = [true - pred for true, pred in zip(y_true, y_pred)]
+    return sum([abs(diff) for diff in differences]) / len(differences)
+
+
+def transform_data_for_cnn(data, lag=1):
+    df = pd.DataFrame(data)
+    columns = [df.shift(i) for i in range(1, lag + 1)]
+    columns.append(df)
+    df = pd.concat(columns, axis=1)
+    df.fillna(0, inplace=True)
+
+    X = df.iloc[:, :-1].values
+    y = df.iloc[:, -1].values
+
+    # Вхідні дані для CNN повинні мати форму [samples, timesteps, features]
+    X = X.reshape(X.shape[0], X.shape[1], 1)
+
+    return X, y
+
+
+def train_cnn_model(X, y, epochs=50, batch_size=32):
+    model = Sequential()
+    model.add(Conv1D(filters=64, kernel_size=2, activation='relu', input_shape=(X.shape[1], X.shape[2])))
+    model.add(MaxPooling1D(pool_size=2))
+    model.add(Flatten())
+    model.add(Dense(50, activation='relu'))
+    model.add(Dense(1))
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0)
+
+    return model
 
 
 def prepare_data(data):
@@ -58,8 +106,14 @@ def prepare_data(data):
 
 def transform_data_for_lstm(data, lag=1):
     df = pd.DataFrame(data)
-    columns = [df.shift(i) for i in range(1, lag + 1)]
-    columns.append(df)
+
+    # Масштабування даних
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    df_scaled = scaler.fit_transform(df.values.reshape(-1, 1))
+
+    df_scaled = pd.DataFrame(df_scaled)
+    columns = [df_scaled.shift(i) for i in range(1, lag + 1)]
+    columns.append(df_scaled)
     df = pd.concat(columns, axis=1)
     df.fillna(0, inplace=True)
 
@@ -69,22 +123,33 @@ def transform_data_for_lstm(data, lag=1):
     # Вхідні дані для LSTM повинні мати форму [samples, timesteps, features]
     X = X.reshape(X.shape[0], X.shape[1], 1)
 
-    return X, y
+    return X, y, scaler
 
 
 def train_lstm_model(X, y, epochs=50, batch_size=32, neurons=50):
     model = Sequential()
-    model.add(LSTM(neurons, input_shape=(X.shape[1], X.shape[2])))
+    model.add(LSTM(neurons, input_shape=(X.shape[1], X.shape[2]), return_sequences=True))  # Додатковий LSTM шар
+    model.add(Dropout(0.2))  # Dropout шар для запобігання перенавчанню
+    model.add(LSTM(neurons))
+    model.add(Dropout(0.2))  # Dropout шар
     model.add(Dense(1))
     model.compile(loss='mean_squared_error', optimizer='adam')
-    model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0)
+
+    # Рання зупинка
+    es = EarlyStopping(monitor='val_loss', patience=5, verbose=1, restore_best_weights=True)
+    model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0, validation_split=0.2,
+              callbacks=[es])  # 20% даних використовуються для валідації
 
     return model
 
 
-def lstm_forecast(model, data):
+def lstm_forecast(model, data, scaler):
     data = data.reshape(data.shape[0], 1, data.shape[1])
-    return model.predict(data)
+    forecast = model.predict(data)
+
+    # Перетворення прогнозування назад до оригінального масштабу
+    forecast = scaler.inverse_transform(forecast)
+    return forecast
 
 
 def forecast_prices(df, forecast_periods=30):
@@ -106,9 +171,9 @@ def forecast_prices(df, forecast_periods=30):
         raise ValueError(f"Error forecasting with ARIMA model: {str(e)}")
 
     # LSTM прогноз
-    data_lstm_X, data_lstm_y = transform_data_for_lstm(price_close.values)
+    data_lstm_X, data_lstm_y, scaler = transform_data_for_lstm(price_close.values)
     model_lstm = train_lstm_model(data_lstm_X, data_lstm_y)
-    forecast_lstm = lstm_forecast(model_lstm, data_lstm_X[-forecast_periods:])
+    forecast_lstm = lstm_forecast(model_lstm, data_lstm_X[-forecast_periods:], scaler)
 
     # Навчання моделі Random Forest:
     X = df.drop(['price_close'], axis=1)
@@ -125,71 +190,127 @@ def forecast_prices(df, forecast_periods=30):
     gb_model.fit(X_train, y_train)
     gb_predictions = gb_model.predict(X_test)
 
+    # CNN прогноз
+    X_cnn, y_cnn = transform_data_for_cnn(price_close.values, lag=5)
+    cnn_model = train_cnn_model(X_cnn, y_cnn)
+    cnn_predictions = cnn_model.predict(X_cnn[-forecast_periods:]).flatten()
+
     # Об'єднання прогнозів:
     combined_forecast = (np.array(forecast_arima) + np.array(
-        forecast_lstm.flatten()) + rf_predictions + gb_predictions) / 4
+        forecast_lstm.flatten()) + rf_predictions + gb_predictions + cnn_predictions) / 5
 
     return combined_forecast
 
 
-# ... ваші інші функції ...
-
 def stack_models(df, forecast_periods=30):
+    """
+    Функція для стекінга різних моделей для прогнозування часових рядів.
 
-    # Дані для навчання та тестування
-    X = df.drop(['price_close'], axis=1)
-    y = df['price_close']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    Параметри:
+        df (pd.DataFrame): вхідний датафрейм з історією часових рядів
+        forecast_periods (int): кількість періодів для прогнозування в майбутнє
 
-    # Отримання прогнозів для ARIMA моделі
+    Повертає:
+        np.array: прогнозовані значення для заданої кількості періодів
+    """
+
+    # Розділення даних на навчальні та тестові за допомогою split_data
+    train_df, test_df = split_data(df)
+    X_train, y_train = train_df.drop(['price_close'], axis=1), train_df['price_close']
+    X_test, y_test = test_df.drop(['price_close'], axis=1), test_df['price_close']
+
+    # Виправимо для прогнозів RF та GB
+    X_all = df.drop(['price_close'], axis=1)
+
+    # Прогнозування ARIMA
     model_arima = auto_arima(y_train, seasonal=True, trace=False, m=12)
     predictions_arima = model_arima.predict(n_periods=len(y_test))
     future_arima = model_arima.predict(n_periods=forecast_periods)
 
-    # Отримання прогнозів для LSTM моделі
-    model_lstm = train_lstm_model(transform_data_for_lstm(y_train)[0], transform_data_for_lstm(y_train)[1])
+    # Обчислення RMSE та MAE для ARIMA прогнозу
+    rmse_arima = compute_RMSE(y_test, predictions_arima)
+    mae_arima = compute_MAE(y_test, future_arima)
+    print("ARIMA RMSE:", rmse_arima)
+    print("ARIMA MAE:", mae_arima)
 
-    lstm_data = transform_data_for_lstm(y_test)[0][-forecast_periods:]
-    if lstm_data.shape[0] == 0:
-        raise ValueError("LSTM data for predictions is empty!")
-    predictions_lstm = lstm_forecast(model_lstm, transform_data_for_lstm(y_test)[0]).flatten()
+    # Прогнозування LSTM
+    lstm_train_data_X, lstm_train_data_y, lstm_train_scaler = transform_data_for_lstm(y_train)
+    if lstm_train_data_X.shape[0] == 0:
+        raise ValueError("LSTM training data is empty or improperly formatted!")
 
-    lstm_future_data = transform_data_for_lstm(y.values)[0][-forecast_periods:]
-    if lstm_future_data.shape[0] == 0:
-        raise ValueError("LSTM data for future forecasting is empty!")
-    future_lstm = lstm_forecast(model_lstm, lstm_future_data).flatten()
+    model_lstm = train_lstm_model(lstm_train_data_X, lstm_train_data_y)
 
-    # Отримання прогнозів для RF моделі
+    lstm_test_data_X, lstm_test_data_y, lstm_test_scaler = transform_data_for_lstm(y_test)
+    if lstm_test_data_X.shape[0] == 0:
+        raise ValueError("LSTM test data is empty or improperly formatted!")
+    predictions_lstm = lstm_forecast(model_lstm, lstm_test_data_X, lstm_test_scaler).flatten()
+
+    if predictions_lstm.shape[0] != y_test.shape[0]:
+        raise ValueError(
+            f"LSTM predictions length ({predictions_lstm.shape[0]}) doesn't match y_test length ({y_test.shape[0]})!")
+
+    lstm_future_data_X, lstm_future_data_y, lstm_future_scaler = transform_data_for_lstm(df['price_close'])
+    if len(lstm_future_data_X) < forecast_periods:
+        raise ValueError(f"LSTM future data has less data than forecast_periods ({forecast_periods})!")
+
+    future_lstm_input = lstm_future_data_X[-forecast_periods:]
+    future_lstm = lstm_forecast(model_lstm, future_lstm_input, lstm_future_scaler).flatten()
+
+    if future_lstm.shape[0] != forecast_periods:
+        raise ValueError(
+            f"LSTM future forecast length ({future_lstm.shape[0]}) doesn't match forecast_periods ({forecast_periods})!")
+
+    # Обчислення RMSE та MAE для LSTM прогнозу
+    rmse_lstm = compute_RMSE(y_test, predictions_lstm)
+    mae_lstm = compute_MAE(y_test, predictions_lstm)
+    print("LSTM RMSE:", rmse_lstm)
+    print("LSTM MAE:", mae_lstm)
+
+    # Прогнозування RF
     model_rf = RandomForestRegressor(n_estimators=100)
     model_rf.fit(X_train, y_train)
     predictions_rf = model_rf.predict(X_test)
-    future_rf = model_rf.predict(X.iloc[-forecast_periods:])
+    future_rf = model_rf.predict(X_all.iloc[-forecast_periods:])
 
-    # Отримання прогнозів для GB моделі
+    # Обчислення RMSE та MAE для RF прогнозу
+    rmse_rf = compute_RMSE(y_test, predictions_rf)
+    mae_rf = compute_MAE(y_test, future_rf)
+    print("RF RMSE:", rmse_rf)
+    print("RF MAE:", mae_rf)
+
+    # Прогнозування GB
     model_gb = GradientBoostingRegressor(n_estimators=100)
     model_gb.fit(X_train, y_train)
     predictions_gb = model_gb.predict(X_test)
-    future_gb = model_gb.predict(X.iloc[-forecast_periods:])
+    future_gb = model_gb.predict(X_all.iloc[-forecast_periods:])
 
-    # Використання прогнозів як особливостей для мета-моделі
-    # print("predictions_arima:", len(predictions_arima))
-    # print("predictions_lstm:", len(predictions_lstm))
-    # print("predictions_rf:", len(predictions_rf))
-    # print("predictions_gb:", len(predictions_gb))
+    # Обчислення RMSE та MAE для GB прогнозу
+    rmse_gb = compute_RMSE(y_test, predictions_gb)
+    mae_gb = compute_MAE(y_test, future_gb)
+    print("RF RMSE:", rmse_gb)
+    print("RF MAE:", mae_gb)
 
-    stacked_features = np.column_stack([predictions_arima, predictions_lstm, predictions_rf, predictions_gb])
+    # Прогнозування CNN
+    X_cnn, y_cnn = transform_data_for_cnn(y_train.values, lag=5)
+    cnn_model = train_cnn_model(X_cnn, y_cnn)
+    predictions_cnn = cnn_model.predict(transform_data_for_cnn(y_test.values, lag=5)[0]).flatten()
+    future_cnn = cnn_model.predict(
+        transform_data_for_cnn(df['price_close'].values, lag=5)[0][-forecast_periods:]).flatten()
 
-    # Навчання мета-моделі
+    # Обчислення RMSE та MAE для CNN прогнозу
+    rmse_cnn = compute_RMSE(y_test, predictions_cnn)
+    mae_cnn = compute_MAE(y_test, future_cnn)
+    print("CNN RMSE:", rmse_cnn)
+    print("CNN MAE:", mae_cnn)
+
+    # Стекінг прогнозів для мета-моделі
+    stacked_features = np.column_stack(
+        [predictions_arima, predictions_lstm, predictions_rf, predictions_gb, predictions_cnn])
+
     meta_model = LinearRegression()
     meta_model.fit(stacked_features, y_test)
 
-    # Прогнозування майбутніх цін
-    # print("future_arima:", len(future_arima))
-    # print("future_lstm:", len(future_lstm))
-    # print("future_rf:", len(future_rf))
-    # print("future_gb:", len(future_gb))
-    future_stacked_features = np.column_stack([future_arima, future_lstm, future_rf, future_gb])
-
+    future_stacked_features = np.column_stack([future_arima, future_lstm, future_rf, future_gb, future_cnn])
     future_predictions = meta_model.predict(future_stacked_features)
 
     return future_predictions
@@ -203,6 +324,7 @@ def get_historical_data(request, name, count, start_time, end_time=None):
     url = f'https://rest.coinapi.io/v1/ohlcv/{name}/history?period_id=1DAY&time_start={start_time}&time_end={end_time}&limit={count}'
 
     headers = {
+        # 'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'
         'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'
     }
 
