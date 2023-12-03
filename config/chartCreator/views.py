@@ -17,6 +17,7 @@ from sklearn.linear_model import LinearRegression
 from keras.layers import Conv1D, MaxPooling1D, Flatten
 from keras.layers import Dropout
 from keras.callbacks import EarlyStopping
+from scipy.stats import t
 
 
 def split_data(data, test_size=0.2):
@@ -85,23 +86,23 @@ def train_cnn_model(X, y, epochs=50, batch_size=32):
 def prepare_data(data):
     df = pd.DataFrame(data)
 
-    # Обчислення технічних показників
+    # Saving original dates
+    original_dates = df['time_period_start'].copy()
+
+    # Calculate technical indicators
     df['RSI'] = compute_RSI(df['price_close'])
     macd, signal = compute_MACD(df['price_close'])
     df['MACD'] = macd
     df['Signal'] = signal
 
-    # Обчислення інших характеристик, як-от волатильність
+    # Calculate other features such as volatility
     df['Volatility'] = df['price_high'] - df['price_low']
 
-    # Обчислення обсягу торгів
-    # Ви вже маєте 'volume_traded' в ваших даних, тому просто переконайтеся, що вони відсортовані вірно.
-
-    # Видалення непотрібних стовпців
+    # Remove unnecessary columns
     columns_to_remove = ['time_period_end', 'time_open', 'time_close', 'time_period_start']
     df.drop(columns_to_remove, axis=1, inplace=True)
 
-    return df
+    return df, original_dates
 
 
 def transform_data_for_lstm(data, lag=1):
@@ -316,6 +317,55 @@ def stack_models(df, forecast_periods=30):
     return future_predictions
 
 
+def calculate_returns(df):
+    df['returns'] = df['price_close'].pct_change()
+    return df
+
+
+def calculate_future_returns(forecasted_prices):
+    returns = np.diff(forecasted_prices) / forecasted_prices[:-1]
+    return returns
+
+
+def calculate_var(returns, confidence_level=0.95):
+    if len(returns) == 0:
+        return None
+    # Сортування доходностей
+    sorted_returns = np.sort(returns)
+    # Розрахунок VaR
+    index = int((1 - confidence_level) * len(sorted_returns))
+    var = sorted_returns[index]
+    return var
+
+
+def calculate_historical_var(returns, confidence_level=0.95):
+    sorted_returns = np.sort(returns)
+    index = int(confidence_level * len(sorted_returns))
+    var = -sorted_returns[index]
+    return var
+
+
+def calculate_t_dist_es(returns, confidence_level=0.95):
+    dof, mean, scale = t.fit(returns)
+    es = t.expect(lambda x: x, args=(dof,), loc=mean, scale=scale, lb=mean - scale * t.ppf(confidence_level, dof))
+    return es
+
+
+def calculate_es(returns, confidence_level=0.95):
+    if len(returns) == 0:
+        return None
+
+    # Сортування доходностей
+    sorted_returns = np.sort(returns)
+    # Розрахунок VaR
+    index = int((1 - confidence_level) * len(sorted_returns))
+    var = sorted_returns[index]
+    # ES - середня втрата у найгірших (1-confidence_level)% випадках
+    es = sorted_returns[:index].mean()
+
+    return es
+
+
 def get_historical_data(request, name, count, start_time, end_time=None):
     if not end_time:
         from datetime import datetime
@@ -324,7 +374,6 @@ def get_historical_data(request, name, count, start_time, end_time=None):
     url = f'https://rest.coinapi.io/v1/ohlcv/{name}/history?period_id=1DAY&time_start={start_time}&time_end={end_time}&limit={count}'
 
     headers = {
-        # 'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'
         'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'
     }
 
@@ -332,50 +381,49 @@ def get_historical_data(request, name, count, start_time, end_time=None):
 
     if response.status_code == 200:
         data = response.json()
-
-        # # Конвертуємо дані в DataFrame
-        # df = pd.DataFrame(data)
-
-        # Нова підготовка даних
-        df = prepare_data(data)
-
-        # Заповнюємо NaN значення середніми значеннями
+        # Обробка даних і збереження оригінальних дат
+        df, original_dates = prepare_data(data)
+        df = calculate_returns(df)  # Розрахунок доходностей
         df.fillna(df.mean(), inplace=True)
 
         if 'price_close' not in df.columns:
             return JsonResponse({"success": False, "response": "price_close column not found in DataFrame"}, status=400)
 
-        # Нормалізація даних
+        # Нормалізація та кластеризація
         try:
             scaler = MinMaxScaler()
             df_normalized = pd.DataFrame(scaler.fit_transform(df[['price_close']]))
-        except Exception as e:
-            return JsonResponse({"success": False, "response": f"Error during normalization: {str(e)}"}, status=500)
-
-        try:
-            # Використання KMeans для кластеризації
             kmeans = KMeans(n_clusters=3)
             kmeans.fit(df_normalized)
             df['cluster'] = kmeans.predict(df_normalized)
-            # Обчислення відстані до центрів кластерів (це буде наш ризик)
             distances = kmeans.transform(df_normalized)
             df['risk'] = distances.min(axis=1)
         except Exception as e:
-            return JsonResponse({"success": False, "response": f"Error during KMeans clustering: {str(e)}"}, status=500)
+            return JsonResponse({"success": False, "response": f"Error during data processing: {str(e)}"}, status=500)
 
-        # Прогнозуємо майбутні ціни
+        # Прогнозування майбутніх цін
         try:
             future_prices = stack_models(df)
+
+            # Розрахунок майбутніх доходностей
+            future_returns = calculate_future_returns(future_prices)
+
+            # Розрахунок VaR та ES
+            var = calculate_historical_var(future_returns)
+            es = calculate_t_dist_es(future_returns)
+
+            # Додавання оригінальних дат до результату
+            historical_data_with_dates = df.assign(date=original_dates).to_dict(orient="records")
         except Exception as e:
             return JsonResponse({"success": False, "response": f"Error during forecasting: {str(e)}"}, status=500)
 
-        # Додаємо прогнозовані ціни до відповіді
         response_data = {
-            "historical_data": df.to_dict(orient="records"),
-            "forecast": future_prices.tolist()
+            "historical_data": historical_data_with_dates,
+            "forecast": future_prices.tolist(),
+            "VaR": var,
+            "ES": es
         }
 
-        # Тепер повертаємо оброблені дані
         return JsonResponse({"success": True, "response": response_data}, status=200)
     else:
         error_message = response.json().get('error', 'Unknown error')
