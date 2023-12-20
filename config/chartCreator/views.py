@@ -18,7 +18,7 @@ from keras.layers import Conv1D, MaxPooling1D, Flatten
 from keras.layers import Dropout
 from keras.callbacks import EarlyStopping
 from scipy.stats import t
-
+from datetime import datetime
 
 def split_data(data, test_size=0.2):
     split_idx = int(len(data) * (1 - test_size))
@@ -366,21 +366,14 @@ def calculate_es(returns, confidence_level=0.95):
     return es
 
 
-def get_historical_data(request, name, count, start_time, end_time=None):
-    if not end_time:
-        from datetime import datetime
-        end_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-
-    url = f'https://rest.coinapi.io/v1/ohlcv/{name}/history?period_id=1DAY&time_start={start_time}&time_end={end_time}&limit={count}'
-
-    headers = {
-        'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'
-    }
-
-    response = requests.get(url, headers=headers)
+def get_forecast_data(request, code):
+    url = f'http://192.168.1.5:5000/api/historicalData/{code}'
+    print('aloooooooooooooo', url)
+    response = requests.get(url)
 
     if response.status_code == 200:
-        data = response.json()
+        response_data = response.json()
+        data = response_data.get('data')
         # Обробка даних і збереження оригінальних дат
         df, original_dates = prepare_data(data)
         df = calculate_returns(df)  # Розрахунок доходностей
@@ -429,6 +422,65 @@ def get_historical_data(request, name, count, start_time, end_time=None):
         error_message = response.json().get('error', 'Unknown error')
         return JsonResponse({"success": False, "response": f"Error: {response.status_code}. Message: {error_message}"},
                             status=response.status_code)
+
+
+def send_to_database(name, data):
+    crypto_code = name.split('_')[2]
+    date_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    payload = {
+        'cryptocurrencyId': 1,
+        'cryptoCode': crypto_code,
+        'date': date_now,
+        'data': data
+    }
+    post_url = 'http://192.168.1.5:5000/api/historicalData'
+
+    try:
+        post_response = requests.post(post_url, json=payload)
+        if post_response.status_code == 200:
+            return {"success": True, "message": "Data successfully saved to database", "post_response": post_response}
+        else:
+            return {"success": False, "message": f"Failed to save data. Status code: {post_response.status_code}",
+                    "response": post_response.text}
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "message": "An error occurred", "error": str(e)}
+
+
+# def get_historical_data(request, name, count, start_time, end_time=None):
+#     db_response = send_to_database(name, testasData['response'])
+#     return JsonResponse({"success": True, "db_response": db_response, "response": testasData['response']}, status=200)
+
+
+# def get_historical_data(request, name, count, start_time, end_time=None):
+#     if not end_time:
+#         end_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+#
+#     url = f'https://rest.coinapi.io/v1/ohlcv/{name}/history?period_id=1DAY&time_start={start_time}&time_end={end_time}&limit={count}'
+#     headers = {'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'}
+#     response = requests.get(url, headers=headers)
+#     data = response.json()
+#     return JsonResponse({"success": True, "response": data}, status=200)
+
+
+def get_historical_data(request, name, count, start_time, end_time=None):
+    if not end_time:
+        end_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    url = f'https://rest.coinapi.io/v1/ohlcv/{name}/history?period_id=1DAY&time_start={start_time}&time_end={end_time}&limit={count}'
+    headers = {'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'}
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        db_response = send_to_database(name, data)
+        if db_response['success']:
+            return JsonResponse({"success": True, "db_response": db_response["message"]}, status=200)
+        else:
+            return JsonResponse(
+                {"success": False, "db_error": db_response["message"], "response": db_response.get("response", "")},
+                status=500)
+    else:
+        return JsonResponse({"success": False, "error": "Request failed"}, status=response.status_code)
 
 
 def load_data_from_json():
