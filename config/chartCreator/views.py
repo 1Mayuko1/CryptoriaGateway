@@ -7,7 +7,6 @@ import requests
 import json
 from django.conf import settings
 import os
-# from statsmodels.tsa.arima.model import ARIMA
 from pmdarima import auto_arima
 from keras.models import Sequential
 from keras.layers import LSTM, Dense
@@ -18,7 +17,14 @@ from keras.layers import Conv1D, MaxPooling1D, Flatten
 from keras.layers import Dropout
 from keras.callbacks import EarlyStopping
 from scipy.stats import t
-from datetime import datetime
+from datetime import datetime, timedelta
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+from statsmodels.tsa.stattools import acf, pacf
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.tsa.seasonal import seasonal_decompose
+from scipy.stats import levene
+
 
 def split_data(data, test_size=0.2):
     split_idx = int(len(data) * (1 - test_size))
@@ -73,7 +79,7 @@ def transform_data_for_cnn(data, lag=1):
 def train_cnn_model(X, y, epochs=50, batch_size=32):
     model = Sequential()
     model.add(Conv1D(filters=64, kernel_size=2, activation='relu', input_shape=(X.shape[1], X.shape[2])))
-    model.add(MaxPooling1D(pool_size=2))
+    # model.add(MaxPooling1D(pool_size=2)) # Видаліть або змініть цей шар
     model.add(Flatten())
     model.add(Dense(50, activation='relu'))
     model.add(Dense(1))
@@ -206,115 +212,114 @@ def forecast_prices(df, forecast_periods=30):
 def stack_models(df, forecast_periods=30):
     """
     Функція для стекінга різних моделей для прогнозування часових рядів.
-
     Параметри:
         df (pd.DataFrame): вхідний датафрейм з історією часових рядів
         forecast_periods (int): кількість періодів для прогнозування в майбутнє
-
     Повертає:
-        np.array: прогнозовані значення для заданої кількості періодів
+        dict: прогнозовані значення та метрики
     """
+    try:
+        model_efficiency = {}
+        models_used = []
+        rmse_values = {}
+        mae_values = {}
+        all_models = ['ARIMA', 'LSTM', 'RandomForest', 'GradientBoosting', 'CNN']
 
-    # Розділення даних на навчальні та тестові за допомогою split_data
-    train_df, test_df = split_data(df)
-    X_train, y_train = train_df.drop(['price_close'], axis=1), train_df['price_close']
-    X_test, y_test = test_df.drop(['price_close'], axis=1), test_df['price_close']
+        model_scores = cross_validate_models(df)
+        best_models = determine_best_model_combination(model_scores)
+        models_used.extend(best_models)
 
-    # Виправимо для прогнозів RF та GB
-    X_all = df.drop(['price_close'], axis=1)
+        total_error = sum(model_scores.values())
+        for model, error in model_scores.items():
+            model_efficiency[model] = ((total_error - error) / total_error) * 100
 
-    # Прогнозування ARIMA
-    model_arima = auto_arima(y_train, seasonal=True, trace=False, m=12)
-    predictions_arima = model_arima.predict(n_periods=len(y_test))
-    future_arima = model_arima.predict(n_periods=forecast_periods)
+        train_df, test_df = split_data(df)
+        X_train, y_train = train_df.drop(['price_close'], axis=1), train_df['price_close']
+        X_test, y_test = test_df.drop(['price_close'], axis=1), test_df['price_close']
 
-    # Обчислення RMSE та MAE для ARIMA прогнозу
-    rmse_arima = compute_RMSE(y_test, predictions_arima)
-    mae_arima = compute_MAE(y_test, future_arima)
-    print("ARIMA RMSE:", rmse_arima)
-    print("ARIMA MAE:", mae_arima)
+        predictions = []
+        for model in best_models:
+            # Прогнозування і обчислення метрик для кожної моделі
+            pred, rmse, mae = perform_prediction_and_metrics(model, X_train, X_test, y_train, y_test, df)
+            predictions.append(pred)
+            rmse_values[model] = rmse
+            mae_values[model] = mae
 
-    # Прогнозування LSTM
-    lstm_train_data_X, lstm_train_data_y, lstm_train_scaler = transform_data_for_lstm(y_train)
-    if lstm_train_data_X.shape[0] == 0:
-        raise ValueError("LSTM training data is empty or improperly formatted!")
+        stacked_predictions = np.column_stack(predictions) if predictions else None
+        forecast = None
+        stacking_rmse = None
+        if stacked_predictions is not None:
+            meta_model = LinearRegression()
+            meta_model.fit(stacked_predictions, y_test)
+            forecast = meta_model.predict(stacked_predictions)
+            stacking_rmse = compute_RMSE(y_test, forecast)
 
-    model_lstm = train_lstm_model(lstm_train_data_X, lstm_train_data_y)
+        average_rmse = np.mean(list(rmse_values.values()))
+        stackingEfficiency = 100 * (average_rmse - stacking_rmse) / average_rmse if average_rmse else 0
 
-    lstm_test_data_X, lstm_test_data_y, lstm_test_scaler = transform_data_for_lstm(y_test)
-    if lstm_test_data_X.shape[0] == 0:
-        raise ValueError("LSTM test data is empty or improperly formatted!")
-    predictions_lstm = lstm_forecast(model_lstm, lstm_test_data_X, lstm_test_scaler).flatten()
+        return {
+            "forecast": forecast.tolist() if forecast is not None else "No forecast",
+            "rmse": rmse_values,
+            "mae": mae_values,
+            "modelsUsed": models_used,
+            "models": all_models,
+            "modelsEfficiency": model_efficiency,
+            "stackingEfficiency": stackingEfficiency
+        }
 
-    if predictions_lstm.shape[0] != y_test.shape[0]:
-        raise ValueError(
-            f"LSTM predictions length ({predictions_lstm.shape[0]}) doesn't match y_test length ({y_test.shape[0]})!")
+    except Exception as e:
+        print("An error occurred during model stacking: ", str(e))
+        return None
 
-    lstm_future_data_X, lstm_future_data_y, lstm_future_scaler = transform_data_for_lstm(df['price_close'])
-    if len(lstm_future_data_X) < forecast_periods:
-        raise ValueError(f"LSTM future data has less data than forecast_periods ({forecast_periods})!")
 
-    future_lstm_input = lstm_future_data_X[-forecast_periods:]
-    future_lstm = lstm_forecast(model_lstm, future_lstm_input, lstm_future_scaler).flatten()
+def perform_prediction_and_metrics(model_name, X_train, X_test, y_train, y_test, df):
+    try:
+        if model_name == 'ARIMA':
+            model_arima = auto_arima(y_train, seasonal=True, trace=False, m=12)
+            predictions = model_arima.predict(n_periods=len(y_test))
+            rmse = compute_RMSE(y_test, predictions)
+            mae = compute_MAE(y_test, predictions)
 
-    if future_lstm.shape[0] != forecast_periods:
-        raise ValueError(
-            f"LSTM future forecast length ({future_lstm.shape[0]}) doesn't match forecast_periods ({forecast_periods})!")
+        elif model_name == 'LSTM':
+            lstm_train_data_X, lstm_train_data_y, lstm_train_scaler = transform_data_for_lstm(y_train)
+            if lstm_train_data_X.size == 0 or lstm_train_data_y.size == 0:
+                raise ValueError("Empty training data for LSTM model.")
+            model_lstm = train_lstm_model(lstm_train_data_X, lstm_train_data_y)
+            predictions = lstm_forecast(model_lstm, lstm_train_data_X, lstm_train_scaler).flatten()
+            rmse = compute_RMSE(y_test, predictions)
+            mae = compute_MAE(y_test, predictions)
 
-    # Обчислення RMSE та MAE для LSTM прогнозу
-    rmse_lstm = compute_RMSE(y_test, predictions_lstm)
-    mae_lstm = compute_MAE(y_test, predictions_lstm)
-    print("LSTM RMSE:", rmse_lstm)
-    print("LSTM MAE:", mae_lstm)
+        elif model_name == 'RandomForest':
+            model_rf = RandomForestRegressor(n_estimators=100)
+            model_rf.fit(X_train, y_train)
+            predictions = model_rf.predict(X_test)
+            rmse = compute_RMSE(y_test, predictions)
+            mae = compute_MAE(y_test, predictions)
 
-    # Прогнозування RF
-    model_rf = RandomForestRegressor(n_estimators=100)
-    model_rf.fit(X_train, y_train)
-    predictions_rf = model_rf.predict(X_test)
-    future_rf = model_rf.predict(X_all.iloc[-forecast_periods:])
+        elif model_name == 'GradientBoosting':
+            model_gb = GradientBoostingRegressor(n_estimators=100)
+            model_gb.fit(X_train, y_train)
+            predictions = model_gb.predict(X_test)
+            rmse = compute_RMSE(y_test, predictions)
+            mae = compute_MAE(y_test, predictions)
 
-    # Обчислення RMSE та MAE для RF прогнозу
-    rmse_rf = compute_RMSE(y_test, predictions_rf)
-    mae_rf = compute_MAE(y_test, future_rf)
-    print("RF RMSE:", rmse_rf)
-    print("RF MAE:", mae_rf)
+        elif model_name == 'CNN':
+            X_cnn, y_cnn = transform_data_for_cnn(y_train.values, lag=5)
+            if X_cnn.size == 0 or y_cnn.size == 0:
+                raise ValueError("Empty training data for CNN model.")
+            cnn_model = train_cnn_model(X_cnn, y_cnn)
+            predictions = cnn_model.predict(transform_data_for_cnn(y_test.values, lag=5)[0]).flatten()
+            rmse = compute_RMSE(y_test, predictions)
+            mae = compute_MAE(y_test, predictions)
 
-    # Прогнозування GB
-    model_gb = GradientBoostingRegressor(n_estimators=100)
-    model_gb.fit(X_train, y_train)
-    predictions_gb = model_gb.predict(X_test)
-    future_gb = model_gb.predict(X_all.iloc[-forecast_periods:])
+        else:
+            raise ValueError(f"Model {model_name} is not recognized.")
 
-    # Обчислення RMSE та MAE для GB прогнозу
-    rmse_gb = compute_RMSE(y_test, predictions_gb)
-    mae_gb = compute_MAE(y_test, future_gb)
-    print("RF RMSE:", rmse_gb)
-    print("RF MAE:", mae_gb)
+        return predictions, rmse, mae
 
-    # Прогнозування CNN
-    X_cnn, y_cnn = transform_data_for_cnn(y_train.values, lag=5)
-    cnn_model = train_cnn_model(X_cnn, y_cnn)
-    predictions_cnn = cnn_model.predict(transform_data_for_cnn(y_test.values, lag=5)[0]).flatten()
-    future_cnn = cnn_model.predict(
-        transform_data_for_cnn(df['price_close'].values, lag=5)[0][-forecast_periods:]).flatten()
-
-    # Обчислення RMSE та MAE для CNN прогнозу
-    rmse_cnn = compute_RMSE(y_test, predictions_cnn)
-    mae_cnn = compute_MAE(y_test, future_cnn)
-    print("CNN RMSE:", rmse_cnn)
-    print("CNN MAE:", mae_cnn)
-
-    # Стекінг прогнозів для мета-моделі
-    stacked_features = np.column_stack(
-        [predictions_arima, predictions_lstm, predictions_rf, predictions_gb, predictions_cnn])
-
-    meta_model = LinearRegression()
-    meta_model.fit(stacked_features, y_test)
-
-    future_stacked_features = np.column_stack([future_arima, future_lstm, future_rf, future_gb, future_cnn])
-    future_predictions = meta_model.predict(future_stacked_features)
-
-    return future_predictions
+    except Exception as e:
+        print(f"Error in model {model_name}: {str(e)}")
+        return None, None, None
 
 
 def calculate_returns(df):
@@ -366,14 +371,200 @@ def calculate_es(returns, confidence_level=0.95):
     return es
 
 
-def get_forecast_data(request, code):
+def advanced_data_analysis(data):
+    results = {}
+
+    # Аналіз стационарності
+    adf_test = adfuller(data['price_close'])
+    kpss_test = kpss(data['price_close'], nlags='auto')
+    results['stationary'] = {
+        'adf_statistic': adf_test[0], 'adf_pvalue': adf_test[1],
+        'kpss_statistic': kpss_test[0], 'kpss_pvalue': kpss_test[1]
+    }
+
+    # Сезонність
+    decomposed = seasonal_decompose(data['price_close'], model='additive', period=30)
+    results['seasonality'] = {
+        'seasonal': decomposed.seasonal,
+        'trend': decomposed.trend,
+        'resid': decomposed.resid,
+        'seasonal_strength': np.std(decomposed.seasonal) / np.std(data['price_close'])
+    }
+
+    # Автокореляція
+    results['acf_values'] = acf(data['price_close'])
+    results['pacf_values'] = pacf(data['price_close'])
+
+    # Волатильність (Використання Levene Test для перевірки однорідності волатильності)
+    levene_test = levene(data['price_high'], data['price_low'])
+    results['volatility'] = {
+        'levene_statistic': levene_test.statistic,
+        'levene_pvalue': levene_test.pvalue
+    }
+
+    return results
+
+
+def cross_validate_models(data, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    errors = {'ARIMA': [], 'LSTM': [], 'RandomForest': [], 'GradientBoosting': [], 'CNN': []}
+
+    for train_idx, test_idx in tscv.split(data):
+        train, test = data.iloc[train_idx], data.iloc[test_idx]
+
+        # ARIMA
+        model_arima = auto_arima(train['price_close'], seasonal=True, trace=False, m=12)
+        predictions_arima = model_arima.predict(n_periods=len(test))
+        errors['ARIMA'].append(mean_squared_error(test['price_close'], predictions_arima))
+
+        # LSTM
+        X_lstm, y_lstm, scaler_lstm = transform_data_for_lstm(train['price_close'])
+        lstm_model = train_lstm_model(X_lstm, y_lstm)
+        X_test_lstm, y_test_lstm, _ = transform_data_for_lstm(test['price_close'])
+        lstm_predictions = lstm_forecast(lstm_model, X_test_lstm, scaler_lstm)
+        errors['LSTM'].append(mean_squared_error(test['price_close'], lstm_predictions.flatten()))
+
+        # RandomForest
+        rf_model = RandomForestRegressor(n_estimators=100)
+        rf_model.fit(train.drop('price_close', axis=1), train['price_close'])
+        rf_predictions = rf_model.predict(test.drop('price_close', axis=1))
+        errors['RandomForest'].append(mean_squared_error(test['price_close'], rf_predictions))
+
+        # GradientBoosting
+        gb_model = GradientBoostingRegressor(n_estimators=100)
+        gb_model.fit(train.drop('price_close', axis=1), train['price_close'])
+        gb_predictions = gb_model.predict(test.drop('price_close', axis=1))
+        errors['GradientBoosting'].append(mean_squared_error(test['price_close'], gb_predictions))
+
+        # CNN
+        X_cnn, y_cnn = transform_data_for_cnn(train['price_close'], lag=2)  # Змінено з lag=1 на lag=2
+        cnn_model = train_cnn_model(X_cnn, y_cnn)
+        X_test_cnn, y_test_cnn = transform_data_for_cnn(test['price_close'], lag=2)[
+                                 0:2]  # Повторна зміна для тестових даних
+        cnn_predictions = cnn_model.predict(X_test_cnn).flatten()
+        errors['CNN'].append(mean_squared_error(y_test_cnn, cnn_predictions))
+
+    # Повертає середні помилки для кожної моделі
+    return {model: np.mean(err) for model, err in errors.items()}
+
+
+def determine_best_model_combination(model_scores):
+    best_combination = []
+    min_error = float('inf')
+
+    models = list(model_scores.keys())
+    for i in range(len(models)):
+        for j in range(i + 1, len(models)):
+            avg_error = (model_scores[models[i]] + model_scores[models[j]]) / 2
+            if avg_error < min_error:
+                min_error = avg_error
+                best_combination = [models[i], models[j]]
+
+    return best_combination
+
+
+# # Advanced Data Analysis
+# analysis_results = advanced_data_analysis(df)
+# print("Advanced Data Analysis Results:", analysis_results)
+#
+# # Cross Validation of Models
+# model_scores = cross_validate_models(df)
+# print("Model Cross Validation Scores:", model_scores)
+#
+# # Best Model Combination
+# best_models = determine_best_model_combination(model_scores)
+# print("Best Model Combination:", best_models)
+
+def determine_notification_type(VaR, ES, rmse, mae):
+    # Встановлення порогових значень
+    var_threshold_risk = -0.05
+    es_threshold_risk = 0.1
+    rmse_threshold_warning = 1000
+    mae_threshold_warning = 500
+
+    # Перевірка на критичні ризики
+    if VaR <= var_threshold_risk or ES >= es_threshold_risk:
+        return "risk"
+
+    # Перевірка на середні ризики
+    average_rmse = np.mean(list(rmse.values()))
+    average_mae = np.mean(list(mae.values()))
+    if average_rmse > rmse_threshold_warning or average_mae > mae_threshold_warning:
+        return "warning"
+
+    # Якщо ризики не виявлені
+    return "info"
+
+
+def notification_delivery(forecast, rmse, mae, modelsUsed, models,
+                          modelEfficiency, stackingEfficiency, VaR, ES, user_id):
+    try:
+        # Перевірка на наявність прогнозу
+        forecast_message = f"Прогноз: {forecast}" if forecast != "No forecast" else "Прогноз відсутній."
+
+        # Формування повідомлення про використані моделі
+        modelsUsed_message = f"Використані моделі: {', '.join(modelsUsed)}."
+
+        # Формування повідомлення про ефективність моделей
+        efficiency_message = "Ефективність моделей: " + ', '.join(
+            [f"{model}: {efficiency:.2f}%" for model, efficiency in modelEfficiency.items()])
+
+        # Формування повідомлення про метрики
+        rmse_message = "RMSE: " + ', '.join([f"{model}: {value:.2f}" for model, value in rmse.items()])
+        mae_message = "MAE: " + ', '.join([f"{model}: {value:.2f}" for model, value in mae.items()])
+
+        # Формування повідомлення про стекінгову ефективність
+        stackingEfficiency_message = f"Ефективність стекінга: {stackingEfficiency:.2f}%"
+
+        # Формування повідомлення про VaR та ES
+        var_message = f"VaR: {VaR:.2f}"
+        es_message = f"ES: {ES:.2f}"
+
+        # Збір повного сповіщення
+        notification = "\n".join(
+            [modelsUsed_message, efficiency_message, rmse_message, mae_message,
+             stackingEfficiency_message, var_message, es_message])
+
+        notification_type = determine_notification_type(VaR, ES, rmse, mae)
+
+        payload = {
+            'userId': user_id,
+            'type': notification_type,
+            'message': notification,
+        }
+
+        post_url = 'http://192.168.1.5:5000/api/userNotifications'
+
+        try:
+            post_response = requests.post(post_url, json=payload)
+            if post_response.status_code == 200:
+                return JsonResponse({
+                    "success": True,
+                    "message": 'Data successfully saved to database'
+                }, status=200)
+            else:
+                return JsonResponse({
+                    "success": False,
+                    "message": f"Failed to save data. Status code: {post_response.status_code}"
+                }, status=200)
+        except requests.exceptions.RequestException as e:
+            return JsonResponse({
+                "success": False,
+                "message": "An error occurred",
+                "error": str(e)
+            }, status=200)
+    except Exception as e:
+        return f"Помилка при формуванні сповіщення: {str(e)}"
+
+
+def get_forecast_data(request, code, user_id):
     url = f'http://192.168.1.5:5000/api/historicalData/{code}'
-    print('aloooooooooooooo', url)
     response = requests.get(url)
 
     if response.status_code == 200:
         response_data = response.json()
         data = response_data.get('data')
+
         # Обробка даних і збереження оригінальних дат
         df, original_dates = prepare_data(data)
         df = calculate_returns(df)  # Розрахунок доходностей
@@ -394,39 +585,95 @@ def get_forecast_data(request, code):
         except Exception as e:
             return JsonResponse({"success": False, "response": f"Error during data processing: {str(e)}"}, status=500)
 
-        # Прогнозування майбутніх цін
+        # Прогнозування майбутніх цін та оцінка моделей
         try:
-            future_prices = stack_models(df)
-
-            # Розрахунок майбутніх доходностей
+            model_results = stack_models(df)
+            future_prices = model_results['forecast']
             future_returns = calculate_future_returns(future_prices)
 
             # Розрахунок VaR та ES
             var = calculate_historical_var(future_returns)
             es = calculate_t_dist_es(future_returns)
 
-            # Додавання оригінальних дат до результату
+            # Додавання оригінальних дат та іншої інформації
             historical_data_with_dates = df.assign(date=original_dates).to_dict(orient="records")
+
         except Exception as e:
             return JsonResponse({"success": False, "response": f"Error during forecasting: {str(e)}"}, status=500)
 
         response_data = {
+            "usedCode": code,
             "historical_data": historical_data_with_dates,
-            "forecast": future_prices.tolist(),
+            "forecast": future_prices,
             "VaR": var,
-            "ES": es
+            "ES": es,
+            "rmse": model_results['rmse'],
+            "mae": model_results['mae'],
+            "modelsUsed": model_results['modelsUsed'],
+            "models": model_results['models'],
+            "modelsEfficiency": model_results['modelsEfficiency'],
+            "stackingEfficiency": model_results['stackingEfficiency']
         }
 
-        return JsonResponse({"success": True, "response": response_data}, status=200)
+        notification_delivery(
+            future_prices,
+            model_results['rmse'],
+            model_results['mae'],
+            model_results['modelsUsed'],
+            model_results['models'],
+            model_results['modelsEfficiency'],
+            model_results['stackingEfficiency'],
+            var,
+            es,
+            user_id
+        )
+
+        date_now_init = datetime.now()
+        date_now_plus_2_hours = date_now_init + timedelta(hours=2)
+        formatted_date = date_now_plus_2_hours.strftime('%Y-%m-%d %H:%M:%S')
+        date_now = formatted_date
+
+        payload = {
+            'cryptocurrencyId': 1,
+            'cryptoCode': code,
+            'forecastDate': date_now,
+            'data': response_data
+        }
+
+        post_url = 'http://192.168.1.5:5000/api/forecastData'
+
+        try:
+            post_response = requests.post(post_url, json=payload)
+            if post_response.status_code == 200:
+                return JsonResponse({
+                    "success": True,
+                    "message": 'Data successfully saved to database'
+                }, status=200)
+            else:
+                return JsonResponse({
+                    "success": False,
+                    "message": f"Failed to save data. Status code: {post_response.status_code}"
+                }, status=200)
+        except requests.exceptions.RequestException as e:
+            return JsonResponse({
+                "success": False,
+                "message": "An error occurred",
+                "error": str(e)
+            }, status=200)
     else:
         error_message = response.json().get('error', 'Unknown error')
         return JsonResponse({"success": False, "response": f"Error: {response.status_code}. Message: {error_message}"},
                             status=response.status_code)
 
 
+# TODO ---------------------------------------------------------------------------------------------------------------
+
 def send_to_database(name, data):
     crypto_code = name.split('_')[2]
-    date_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    date_now_init = datetime.now()
+    date_now_plus_2_hours = date_now_init + timedelta(hours=2)
+    formatted_date = date_now_plus_2_hours.strftime('%Y-%m-%d %H:%M:%S')
+    date_now = formatted_date
     payload = {
         'cryptocurrencyId': 1,
         'cryptoCode': crypto_code,
@@ -444,22 +691,6 @@ def send_to_database(name, data):
                     "response": post_response.text}
     except requests.exceptions.RequestException as e:
         return {"success": False, "message": "An error occurred", "error": str(e)}
-
-
-# def get_historical_data(request, name, count, start_time, end_time=None):
-#     db_response = send_to_database(name, testasData['response'])
-#     return JsonResponse({"success": True, "db_response": db_response, "response": testasData['response']}, status=200)
-
-
-# def get_historical_data(request, name, count, start_time, end_time=None):
-#     if not end_time:
-#         end_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-#
-#     url = f'https://rest.coinapi.io/v1/ohlcv/{name}/history?period_id=1DAY&time_start={start_time}&time_end={end_time}&limit={count}'
-#     headers = {'X-CoinAPI-Key': 'FF4AACC3-C6FF-47A1-8F4D-5EB8DC574699'}
-#     response = requests.get(url, headers=headers)
-#     data = response.json()
-#     return JsonResponse({"success": True, "response": data}, status=200)
 
 
 def get_historical_data(request, name, count, start_time, end_time=None):
