@@ -497,10 +497,12 @@ def determine_notification_type(VaR, ES, rmse, mae):
 
 
 def notification_delivery(forecast, rmse, mae, modelsUsed, models,
-                          modelEfficiency, stackingEfficiency, VaR, ES, user_id):
+                          modelEfficiency, stackingEfficiency, VaR, ES, user_id, code):
     try:
         # Перевірка на наявність прогнозу
         forecast_message = f"Прогноз: {forecast}" if forecast != "No forecast" else "Прогноз відсутній."
+
+        forecast_for_code = f"Прогноз для {code}"
 
         # Формування повідомлення про використані моделі
         modelsUsed_message = f"Використані моделі: {', '.join(modelsUsed)}."
@@ -522,7 +524,7 @@ def notification_delivery(forecast, rmse, mae, modelsUsed, models,
 
         # Збір повного сповіщення
         notification = "\n".join(
-            [modelsUsed_message, efficiency_message, rmse_message, mae_message,
+            [forecast_for_code, modelsUsed_message, efficiency_message, rmse_message, mae_message,
              stackingEfficiency_message, var_message, es_message])
 
         notification_type = determine_notification_type(VaR, ES, rmse, mae)
@@ -625,7 +627,8 @@ def get_forecast_data(request, code, user_id):
             model_results['stackingEfficiency'],
             var,
             es,
-            user_id
+            user_id,
+            code
         )
 
         date_now_init = datetime.now()
