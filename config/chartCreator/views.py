@@ -24,6 +24,30 @@ from statsmodels.tsa.stattools import acf, pacf
 from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.tsa.seasonal import seasonal_decompose
 from scipy.stats import levene
+from joblib import dump, load
+import os
+
+
+def save_model(model, filename):
+    dump(model, filename)
+
+
+def load_model(filename):
+    return load(filename)
+
+
+def train_or_load_model(model_name, train_function, *args, **kwargs):
+    model_file = f'{model_name}.joblib'
+
+    if os.path.exists(model_file):
+        print(f"Завантаження моделі {model_name}")
+        model = load_model(model_file)
+    else:
+        print(f"Навчання моделі {model_name}")
+        model = train_function(*args, **kwargs)
+        save_model(model, model_file)
+
+    return model
 
 
 def split_data(data, test_size=0.2):
@@ -237,22 +261,26 @@ def stack_models(df, forecast_periods=30):
         X_train, y_train = train_df.drop(['price_close'], axis=1), train_df['price_close']
         X_test, y_test = test_df.drop(['price_close'], axis=1), test_df['price_close']
 
+        # Отримання прогнозів від різних моделей
         predictions = []
         for model in best_models:
-            # Прогнозування і обчислення метрик для кожної моделі
             pred, rmse, mae = perform_prediction_and_metrics(model, X_train, X_test, y_train, y_test, df)
-            predictions.append(pred)
+            if pred is not None:
+                predictions.append(pred)
             rmse_values[model] = rmse
             mae_values[model] = mae
 
-        stacked_predictions = np.column_stack(predictions) if predictions else None
-        forecast = None
-        stacking_rmse = None
-        if stacked_predictions is not None:
+        # Обрізка прогнозів до мінімальної довжини
+        min_length = min(len(pred) for pred in predictions)
+        trimmed_predictions = [pred[:min_length] for pred in predictions]
+
+        # Об'єднання прогнозів
+        if trimmed_predictions:
+            stacked_predictions = np.column_stack(trimmed_predictions)
             meta_model = LinearRegression()
-            meta_model.fit(stacked_predictions, y_test)
+            meta_model.fit(stacked_predictions, y_test[:min_length])
             forecast = meta_model.predict(stacked_predictions)
-            stacking_rmse = compute_RMSE(y_test, forecast)
+            stacking_rmse = compute_RMSE(y_test[:min_length], forecast)
 
         average_rmse = np.mean(list(rmse_values.values()))
         stackingEfficiency = 100 * (average_rmse - stacking_rmse) / average_rmse if average_rmse else 0
@@ -264,7 +292,7 @@ def stack_models(df, forecast_periods=30):
             "modelsUsed": models_used,
             "models": all_models,
             "modelsEfficiency": model_efficiency,
-            "stackingEfficiency": stackingEfficiency
+            "stackingEfficiency": stackingEfficiency,
         }
 
     except Exception as e:
@@ -274,46 +302,42 @@ def stack_models(df, forecast_periods=30):
 
 def perform_prediction_and_metrics(model_name, X_train, X_test, y_train, y_test, df):
     try:
+        predictions, rmse, mae = None, None, None
+
         if model_name == 'ARIMA':
-            model_arima = auto_arima(y_train, seasonal=True, trace=False, m=12)
+            model_arima = train_or_load_model('arima', auto_arima, y_train, seasonal=True, trace=False, m=12)
             predictions = model_arima.predict(n_periods=len(y_test))
-            rmse = compute_RMSE(y_test, predictions)
-            mae = compute_MAE(y_test, predictions)
 
         elif model_name == 'LSTM':
             lstm_train_data_X, lstm_train_data_y, lstm_train_scaler = transform_data_for_lstm(y_train)
             if lstm_train_data_X.size == 0 or lstm_train_data_y.size == 0:
                 raise ValueError("Empty training data for LSTM model.")
-            model_lstm = train_lstm_model(lstm_train_data_X, lstm_train_data_y)
+            model_lstm = train_or_load_model('lstm', train_lstm_model, lstm_train_data_X, lstm_train_data_y)
             predictions = lstm_forecast(model_lstm, lstm_train_data_X, lstm_train_scaler).flatten()
-            rmse = compute_RMSE(y_test, predictions)
-            mae = compute_MAE(y_test, predictions)
 
         elif model_name == 'RandomForest':
             model_rf = RandomForestRegressor(n_estimators=100)
-            model_rf.fit(X_train, y_train)
+            model_rf = train_or_load_model('random_forest', lambda X, y: model_rf.fit(X, y), X_train, y_train)
             predictions = model_rf.predict(X_test)
-            rmse = compute_RMSE(y_test, predictions)
-            mae = compute_MAE(y_test, predictions)
 
         elif model_name == 'GradientBoosting':
             model_gb = GradientBoostingRegressor(n_estimators=100)
-            model_gb.fit(X_train, y_train)
+            model_gb = train_or_load_model('gradient_boosting', lambda X, y: model_gb.fit(X, y), X_train, y_train)
             predictions = model_gb.predict(X_test)
-            rmse = compute_RMSE(y_test, predictions)
-            mae = compute_MAE(y_test, predictions)
 
         elif model_name == 'CNN':
             X_cnn, y_cnn = transform_data_for_cnn(y_train.values, lag=5)
             if X_cnn.size == 0 or y_cnn.size == 0:
                 raise ValueError("Empty training data for CNN model.")
-            cnn_model = train_cnn_model(X_cnn, y_cnn)
-            predictions = cnn_model.predict(transform_data_for_cnn(y_test.values, lag=5)[0]).flatten()
-            rmse = compute_RMSE(y_test, predictions)
-            mae = compute_MAE(y_test, predictions)
+            model_cnn = train_or_load_model('cnn', train_cnn_model, X_cnn, y_cnn)
+            predictions = model_cnn.predict(transform_data_for_cnn(y_test.values, lag=5)[0]).flatten()
 
         else:
             raise ValueError(f"Model {model_name} is not recognized.")
+
+        if predictions is not None:
+            rmse = compute_RMSE(y_test, predictions)
+            mae = compute_MAE(y_test, predictions)
 
         return predictions, rmse, mae
 
@@ -413,38 +437,36 @@ def cross_validate_models(data, n_splits=5):
         train, test = data.iloc[train_idx], data.iloc[test_idx]
 
         # ARIMA
-        model_arima = auto_arima(train['price_close'], seasonal=True, trace=False, m=12)
+        model_arima = train_or_load_model('arima_cv', auto_arima, train['price_close'], seasonal=True, trace=False, m=12)
         predictions_arima = model_arima.predict(n_periods=len(test))
         errors['ARIMA'].append(mean_squared_error(test['price_close'], predictions_arima))
 
         # LSTM
         X_lstm, y_lstm, scaler_lstm = transform_data_for_lstm(train['price_close'])
-        lstm_model = train_lstm_model(X_lstm, y_lstm)
+        lstm_model = train_or_load_model('lstm_cv', train_lstm_model, X_lstm, y_lstm)
         X_test_lstm, y_test_lstm, _ = transform_data_for_lstm(test['price_close'])
         lstm_predictions = lstm_forecast(lstm_model, X_test_lstm, scaler_lstm)
         errors['LSTM'].append(mean_squared_error(test['price_close'], lstm_predictions.flatten()))
 
         # RandomForest
         rf_model = RandomForestRegressor(n_estimators=100)
-        rf_model.fit(train.drop('price_close', axis=1), train['price_close'])
+        rf_model = train_or_load_model('random_forest_cv', lambda X, y: rf_model.fit(X, y), train.drop('price_close', axis=1), train['price_close'])
         rf_predictions = rf_model.predict(test.drop('price_close', axis=1))
         errors['RandomForest'].append(mean_squared_error(test['price_close'], rf_predictions))
 
         # GradientBoosting
         gb_model = GradientBoostingRegressor(n_estimators=100)
-        gb_model.fit(train.drop('price_close', axis=1), train['price_close'])
+        gb_model = train_or_load_model('gradient_boosting_cv', lambda X, y: gb_model.fit(X, y), train.drop('price_close', axis=1), train['price_close'])
         gb_predictions = gb_model.predict(test.drop('price_close', axis=1))
         errors['GradientBoosting'].append(mean_squared_error(test['price_close'], gb_predictions))
 
         # CNN
-        X_cnn, y_cnn = transform_data_for_cnn(train['price_close'], lag=2)  # Змінено з lag=1 на lag=2
-        cnn_model = train_cnn_model(X_cnn, y_cnn)
-        X_test_cnn, y_test_cnn = transform_data_for_cnn(test['price_close'], lag=2)[
-                                 0:2]  # Повторна зміна для тестових даних
+        X_cnn, y_cnn = transform_data_for_cnn(train['price_close'], lag=2)
+        cnn_model = train_or_load_model('cnn_cv', train_cnn_model, X_cnn, y_cnn)
+        X_test_cnn, y_test_cnn = transform_data_for_cnn(test['price_close'], lag=2)[0:2]
         cnn_predictions = cnn_model.predict(X_test_cnn).flatten()
         errors['CNN'].append(mean_squared_error(y_test_cnn, cnn_predictions))
 
-    # Повертає середні помилки для кожної моделі
     return {model: np.mean(err) for model, err in errors.items()}
 
 
